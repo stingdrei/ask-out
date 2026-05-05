@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-//  ask-out  ·  Three.js
-//  Features: First-person look, table, letter inspect, fireworks
+//  ask-out · Three.js
+//  WASD movement · walk boundaries · picnic · readable letters
 // ═══════════════════════════════════════════════════════════
 
 const scene    = new THREE.Scene();
@@ -11,9 +11,7 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.setClearColor(0x0a0010);
 document.body.appendChild(renderer.domElement);
-
-// Expose canvas globally so index.html start button can call requestPointerLock on it
-window.threeCanvas = renderer.domElement;
+window.threeCanvas = renderer.domElement;   // used by index.html start button
 
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -22,432 +20,505 @@ window.addEventListener('resize', () => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  FIRST-PERSON CAMERA  —  mouse moves camera freely (no click-drag)
+//  SPEED & BOUNDARY CONTROLS  ← easy to tune
 // ═══════════════════════════════════════════════════════════
-camera.position.set(0, 1.6, 3); // starting position: eye-level, a few units back
+const MOUSE_SENSITIVITY = 0.0018;   // camera turn speed — lower = slower
+const WALK_SPEED        = 0.07;     // units per frame — lower = slower walk
 
-const look = {
-    yaw:   0,    // horizontal rotation (left / right)
-    pitch: 0,    // vertical tilt (up / down)
-    locked: false, // true when pointer is locked
+const BOUNDARY = {                  // player cannot walk outside these limits
+    minX: -9, maxX: 9,
+    minZ: -10, maxZ:  8,
 };
 
-// ── SPEED CONTROLS ─────────────────────────────────────────
-//   ↓ Change these values to adjust camera sensitivity
-const MOUSE_SENSITIVITY = 0.0018;  // lower = slower, higher = faster
-// ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  FIRST-PERSON CAMERA
+// ═══════════════════════════════════════════════════════════
+const PLAYER_HEIGHT = 1.6;
+camera.position.set(0, PLAYER_HEIGHT, 6);
 
-function updateCamera() {
+const look = { yaw: Math.PI, pitch: 0, locked: false };
+
+// Reusable quaternions — allocated once, never inside the render loop
+const _yawQ   = new THREE.Quaternion();
+const _pitchQ = new THREE.Quaternion();
+const _Y_AXIS = new THREE.Vector3(0, 1, 0);
+const _X_AXIS = new THREE.Vector3(1, 0, 0);
+
+function applyLook() {
     look.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, look.pitch));
-    const dir = new THREE.Vector3(
-        Math.sin(look.yaw)  * Math.cos(look.pitch),
-        Math.sin(look.pitch),
-        Math.cos(look.yaw)  * Math.cos(look.pitch)
-    );
-    camera.lookAt(camera.position.clone().add(dir));
+    _yawQ.setFromAxisAngle(_Y_AXIS, look.yaw);
+    _pitchQ.setFromAxisAngle(_X_AXIS, look.pitch);
+    camera.quaternion.copy(_yawQ).multiply(_pitchQ);
 }
-updateCamera();
+applyLook();
 
-// Pointer lock is requested by the start button in index.html
-// Re-lock when user clicks canvas after ESC (but not while inspecting)
+// Pointer lock
 renderer.domElement.addEventListener('click', () => {
-    if (!inspectMode && !document.pointerLockElement) {
+    if (!inspectMode && !document.pointerLockElement)
         renderer.domElement.requestPointerLock();
-    }
 });
-
 document.addEventListener('pointerlockchange', () => {
     look.locked = document.pointerLockElement === renderer.domElement;
 });
 
+// Update yaw/pitch directly in mousemove — no accumulation, no large delta buildup
+// applyLook() is called once per frame in animate(), not here
 document.addEventListener('mousemove', e => {
-    if (!look.locked) return;
-    if (inspectMode) return; // freeze look while inspecting a letter
-
-    //  ↓ MOUSE_SENSITIVITY controls how fast the camera turns
+    if (!look.locked || inspectMode) return;
     look.yaw   -= e.movementX * MOUSE_SENSITIVITY;
     look.pitch -= e.movementY * MOUSE_SENSITIVITY;
-    updateCamera();
 });
 
-// Touch fallback (mobile: drag to look)
-const touch = { lastX: 0, lastY: 0, active: false };
+// Touch look (mobile fallback)
+const touch = { lx: 0, ly: 0, on: false };
 renderer.domElement.addEventListener('touchstart', e => {
-    touch.active = true;
-    touch.lastX = e.touches[0].clientX;
-    touch.lastY = e.touches[0].clientY;
+    touch.on = true; touch.lx = e.touches[0].clientX; touch.ly = e.touches[0].clientY;
 }, { passive: true });
 window.addEventListener('touchmove', e => {
-    if (!touch.active || inspectMode) return;
-    look.yaw   -= (e.touches[0].clientX - touch.lastX) * MOUSE_SENSITIVITY * 2;
-    look.pitch -= (e.touches[0].clientY - touch.lastY) * MOUSE_SENSITIVITY * 2;
-    touch.lastX = e.touches[0].clientX;
-    touch.lastY = e.touches[0].clientY;
-    updateCamera();
+    if (!touch.on || inspectMode) return;
+    look.yaw   -= (e.touches[0].clientX - touch.lx) * MOUSE_SENSITIVITY * 2;
+    look.pitch -= (e.touches[0].clientY - touch.ly) * MOUSE_SENSITIVITY * 2;
+    touch.lx = e.touches[0].clientX; touch.ly = e.touches[0].clientY;
 }, { passive: true });
-window.addEventListener('touchend', () => { touch.active = false; });
+window.addEventListener('touchend', () => { touch.on = false; });
+
+// ═══════════════════════════════════════════════════════════
+//  WASD MOVEMENT  (no jumping — Y is always PLAYER_HEIGHT)
+// ═══════════════════════════════════════════════════════════
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; });
+window.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+function movePlayer() {
+    if (inspectMode) return;
+
+    // Horizontal forward/right vectors — pitch is ignored so player never flies
+    const fwd   = new THREE.Vector3( Math.sin(look.yaw), 0,  Math.cos(look.yaw));
+    const right = new THREE.Vector3( Math.cos(look.yaw), 0, -Math.sin(look.yaw));
+    const move  = new THREE.Vector3();
+
+    if (keys['KeyW'] || keys['ArrowUp'])    move.addScaledVector(fwd,   -1);
+    if (keys['KeyS'] || keys['ArrowDown'])  move.addScaledVector(fwd,    1);
+    if (keys['KeyA'] || keys['ArrowLeft'])  move.addScaledVector(right, -1);
+    if (keys['KeyD'] || keys['ArrowRight']) move.addScaledVector(right,  1);
+
+    if (move.lengthSq() === 0) return;
+    move.normalize().multiplyScalar(WALK_SPEED);    // ← WALK_SPEED
+
+    // Apply + clamp to boundary
+    camera.position.x = Math.max(BOUNDARY.minX, Math.min(BOUNDARY.maxX, camera.position.x + move.x));
+    camera.position.z = Math.max(BOUNDARY.minZ, Math.min(BOUNDARY.maxZ, camera.position.z + move.z));
+    camera.position.y = PLAYER_HEIGHT;
+}
 
 // ═══════════════════════════════════════════════════════════
 //  LIGHTS
 // ═══════════════════════════════════════════════════════════
-scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+scene.add(new THREE.AmbientLight(0xffeedd, 0.55));
 
-const pinkLight = new THREE.PointLight(0xff69b4, 5, 40);
+const sun = new THREE.DirectionalLight(0xfff4d0, 1.2);
+sun.position.set(10, 20, 5);
+sun.castShadow = true;
+scene.add(sun);
+
+const pinkLight   = new THREE.PointLight(0xff69b4, 4, 40);
+const purpleLight = new THREE.PointLight(0xaa44ff, 3, 40);
 pinkLight.position.set(4, 6, 4);
-pinkLight.castShadow = true;
-scene.add(pinkLight);
-
-const purpleLight = new THREE.PointLight(0xaa44ff, 5, 40);
 purpleLight.position.set(-4, 4, -4);
-scene.add(purpleLight);
-
-const tableLight = new THREE.PointLight(0xffffff, 2, 10);
-tableLight.position.set(0, 4, -4);
-scene.add(tableLight);
+scene.add(pinkLight, purpleLight);
 
 // ═══════════════════════════════════════════════════════════
 //  STARFIELD
 // ═══════════════════════════════════════════════════════════
+const starPos = new Float32Array(2000 * 3);
+for (let i = 0; i < starPos.length; i++) starPos[i] = (Math.random() - 0.5) * 300;
 const starGeo = new THREE.BufferGeometry();
-const starCount = 2000;
-const starPos = new Float32Array(starCount * 3);
-for (let i = 0; i < starCount * 3; i++) starPos[i] = (Math.random() - 0.5) * 300;
 starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
 scene.add(new THREE.Points(starGeo,
-    new THREE.PointsMaterial({ color: 0xffffff, size: 0.15, transparent: true, opacity: 0.8 })
+    new THREE.PointsMaterial({ color: 0xffffff, size: 0.14, transparent: true, opacity: 0.75 })
 ));
 
 // ═══════════════════════════════════════════════════════════
-//  FLOOR
+//  GRASS GROUND
 // ═══════════════════════════════════════════════════════════
-const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(60, 60),
-    new THREE.MeshPhongMaterial({ color: 0x110022, shininess: 30 })
+const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(80, 80),
+    new THREE.MeshPhongMaterial({ color: 0x2a5414, shininess: 4 })
 );
-floor.rotation.x = -Math.PI / 2;
-floor.position.y = -0.01;
-floor.receiveShadow = true;
-scene.add(floor);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
 
 // ═══════════════════════════════════════════════════════════
-//  DECORATIVE CUBE  (original, kept)
+//  PICNIC BLANKET  (red-white checker)
 // ═══════════════════════════════════════════════════════════
-const cube = new THREE.Mesh(
-    new THREE.BoxGeometry(),
-    new THREE.MeshPhongMaterial({ color: 0x00ff88, emissive: 0x003322, shininess: 80 })
+function makeChecker() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 512;
+    const ctx = c.getContext('2d');
+    const sq = 64;
+    for (let r = 0; r < 8; r++)
+        for (let col = 0; col < 8; col++) {
+            ctx.fillStyle = (r + col) % 2 === 0 ? '#cc2020' : '#f5f0e8';
+            ctx.fillRect(col * sq, r * sq, sq, sq);
+        }
+    return new THREE.CanvasTexture(c);
+}
+
+const blanket = new THREE.Mesh(
+    new THREE.PlaneGeometry(6, 5),
+    new THREE.MeshPhongMaterial({ map: makeChecker(), shininess: 4 })
 );
-cube.position.set(-7, 1, -7);
-cube.castShadow = true;
-scene.add(cube);
+blanket.rotation.x = -Math.PI / 2;
+blanket.position.set(0, 0.01, -4);
+blanket.receiveShadow = true;
+scene.add(blanket);
+
+// Border trim
+const trimMat = new THREE.MeshPhongMaterial({ color: 0x8b1010 });
+[{ s: [6.2, 0.04, 0.14], p: [0, 0.025,  -1.43] },
+ { s: [6.2, 0.04, 0.14], p: [0, 0.025,  -6.57] },
+ { s: [0.14, 0.04, 5.2], p: [-3.07, 0.025, -4] },
+ { s: [0.14, 0.04, 5.2], p: [ 3.07, 0.025, -4] }].forEach(({ s, p }) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(...s), trimMat);
+    m.position.set(...p); scene.add(m);
+});
+
+// ─── Picnic basket ───────────────────────────────────────────
+const basketMat = new THREE.MeshPhongMaterial({ color: 0xb8860b, shininess: 20 });
+const basket = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.4, 0.7, 12), basketMat);
+basket.position.set(2.3, 0.35, -5.6); basket.castShadow = true; scene.add(basket);
+const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.52, 0.52, 0.1, 12), basketMat);
+lid.position.set(2.3, 0.76, -5.6); scene.add(lid);
+const handle = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.045, 8, 16, Math.PI), basketMat);
+handle.position.set(2.3, 0.98, -5.6); scene.add(handle);
+
+// ─── Plate + cup ─────────────────────────────────────────────
+const plate = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.5, 0.46, 0.05, 24),
+    new THREE.MeshPhongMaterial({ color: 0xf8f8f8, shininess: 80 })
+);
+plate.position.set(-1.6, 0.025, -3.4); scene.add(plate);
+
+const cup = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.17, 0.12, 0.42, 12),
+    new THREE.MeshPhongMaterial({ color: 0xff4444, shininess: 60 })
+);
+cup.position.set(-0.5, 0.21, -5.3); scene.add(cup);
+
+// ─── Flowers around the blanket ──────────────────────────────
+function addFlower(x, z) {
+    const stemMat = new THREE.MeshPhongMaterial({ color: 0x228b22 });
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.28, 6), stemMat);
+    stem.position.set(x, 0.14, z); scene.add(stem);
+    const petal = new THREE.Mesh(
+        new THREE.SphereGeometry(0.11, 8, 8),
+        new THREE.MeshPhongMaterial({ color: new THREE.Color().setHSL(Math.random(), 1, 0.65) })
+    );
+    petal.position.set(x, 0.33, z); scene.add(petal);
+}
+[[-4.5,-2],[4.5,-2],[-4.5,-6],[4.5,-6],[0,-7.5],
+ [-2.5,-7.8],[2.5,-7.8],[-5.5,-4],[5.5,-4],
+ [-3,-1],[3,-1],[-1.5,-8],[1.5,-8]].forEach(([x,z]) => addFlower(x,z));
 
 // ═══════════════════════════════════════════════════════════
-//  TEXT TEXTURE HELPER
+//  FLOATING SIGNS
 // ═══════════════════════════════════════════════════════════
-function createTextTexture(text, color = '#ffffff', fontSize = 48, canvasW = 1024, canvasH = 256) {
-    // ↑ canvasW / canvasH — increase for sharper / wider text boxes
-    const canvas = document.createElement('canvas');
-    canvas.width  = canvasW;
-    canvas.height = canvasH;
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvasW, canvasH);
-    ctx.font         = `bold ${fontSize}px Georgia, serif`;
-    ctx.fillStyle    = color;
-    ctx.textAlign    = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.shadowColor  = color;
-    ctx.shadowBlur   = 24;
-    ctx.fillText(text, canvasW / 2, canvasH / 2);
-    return new THREE.CanvasTexture(canvas);
+function makeTextTex(text, color = '#ffffff', size = 52, w = 1024, h = 256) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = `bold ${size}px Georgia,serif`;
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = color; ctx.shadowBlur = 22;
+    ctx.fillText(text, w / 2, h / 2);
+    return new THREE.CanvasTexture(c);
+}
+
+const sign = new THREE.Mesh(new THREE.PlaneGeometry(9, 1.8),
+    new THREE.MeshBasicMaterial({ map: makeTextTex('Will you go out with me? 💕','#ff9ec4'), transparent:true, side:THREE.DoubleSide }));
+sign.position.set(0, 3.5, -11); scene.add(sign);
+
+const signBack = new THREE.Mesh(new THREE.PlaneGeometry(9, 1.8),
+    new THREE.MeshBasicMaterial({ map: makeTextTex('Please say YES! 🌸','#ffdf80',56), transparent:true, side:THREE.DoubleSide }));
+signBack.position.set(0, 3.5, 9.5); signBack.rotation.y = Math.PI; scene.add(signBack);
+
+// ═══════════════════════════════════════════════════════════
+//  LETTER CONTENTS  — what each letter says
+// ═══════════════════════════════════════════════════════════
+const CONTENTS = [
+    ['To my favorite person,', '', 'Every moment with you feels', 'like sunshine. ☀️', '', 'You make everything brighter.', 'Always. 💛'],
+    ['Hey you,', '', 'I\'ve been meaning to ask...', 'Will you go out with me? 🌸', '', 'Pretty please?', '  — Your secret admirer'],
+    ['P.S.  Just say yes. 😊', '', 'I promise picnics,', 'sunsets, and fireworks 🎆', '', '...and lots of letters', 'just like this one. 💌'],
+];
+
+// ═══════════════════════════════════════════════════════════
+//  LETTER PAPER TEXTURE  (looks like a real handwritten note)
+// ═══════════════════════════════════════════════════════════
+function makeLetterTex(lines) {
+    const W = 800, H = 600;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+
+    // Paper
+    ctx.fillStyle = '#fffdf0';
+    ctx.fillRect(0, 0, W, H);
+
+    // Ruled lines
+    ctx.strokeStyle = '#e0d8c0'; ctx.lineWidth = 1;
+    for (let y = 68; y < H - 10; y += 44) {
+        ctx.beginPath(); ctx.moveTo(50, y); ctx.lineTo(W - 50, y); ctx.stroke();
+    }
+
+    // Red margin
+    ctx.strokeStyle = '#ffb0b0'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(88, 20); ctx.lineTo(88, H - 20); ctx.stroke();
+
+    // Handwriting
+    ctx.fillStyle = '#2a1a0a';
+    ctx.shadowBlur = 0;
+    lines.forEach((line, i) => {
+        if (line === '') return;
+        // Alternate slightly between sizes for natural feel
+        ctx.font = `italic ${i === 0 ? 30 : 28}px Georgia,serif`;
+        ctx.fillText(line, 100, 52 + i * 44);
+    });
+
+    return new THREE.CanvasTexture(c);
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SIGNS  (wider PlaneGeometry + larger canvas = no cutoff)
+//  ENVELOPE / LETTER OBJECTS
 // ═══════════════════════════════════════════════════════════
+const ENV_COLORS  = [0xffddaa, 0xffd6e0, 0xd6e8ff];
+const SEAL_COLORS = ['#c8842a', '#cc6688', '#6688cc'];
+const YES         = ['Y', 'E', 'S'];
 
-// Front sign — visible straight ahead from start
-const sign = new THREE.Mesh(
-    new THREE.PlaneGeometry(9, 1.8),   // ← width increased (was 5)
-    new THREE.MeshBasicMaterial({
-        map: createTextTexture('Will you go out with me? 💕', '#ff9ec4', 52, 1024, 256),
-        transparent: true,
-        side: THREE.DoubleSide,
-    })
-);
-sign.position.set(0, 3.2, -9);
-scene.add(sign);
+// Where each envelope rests on the blanket (world-space, never changes)
+const REST_POS = [
+    new THREE.Vector3(-1.8, 0.04, -4.3),
+    new THREE.Vector3( 0,   0.04, -4.3),
+    new THREE.Vector3( 1.8, 0.04, -4.3),
+];
+const REST_ROT = [
+    new THREE.Euler(-Math.PI/2, 0, -0.15),
+    new THREE.Euler(-Math.PI/2, 0,  0.04),
+    new THREE.Euler(-Math.PI/2, 0,  0.18),
+];
 
-// Back sign — turn around to read it
-const signBack = new THREE.Mesh(
-    new THREE.PlaneGeometry(9, 1.8),   // ← width increased
-    new THREE.MeshBasicMaterial({
-        map: createTextTexture('Please say YES! 🌸', '#ffdf80', 56, 1024, 256),
-        transparent: true,
-        side: THREE.DoubleSide,
-    })
-);
-signBack.position.set(0, 3.2, 9);
-signBack.rotation.y = Math.PI;
-scene.add(signBack);
-
-// ═══════════════════════════════════════════════════════════
-//  TABLE
-// ═══════════════════════════════════════════════════════════
-const tableMat = new THREE.MeshPhongMaterial({ color: 0x5c3317, shininess: 60 });
-
-// Tabletop
-const tabletop = new THREE.Mesh(new THREE.BoxGeometry(7, 0.18, 3), tableMat);
-tabletop.position.set(0, 1.05, -5);
-tabletop.castShadow  = true;
-tabletop.receiveShadow = true;
-scene.add(tabletop);
-
-// Four legs
-const legGeo = new THREE.BoxGeometry(0.18, 1.05, 0.18);
-[[-3.3, -1], [3.3, -1], [-3.3, 1], [3.3, 1]].forEach(([x, zOff]) => {
-    const leg = new THREE.Mesh(legGeo, tableMat);
-    leg.position.set(x, 0.525, -5 + zOff);
-    leg.castShadow = true;
-    scene.add(leg);
-});
-
-// ═══════════════════════════════════════════════════════════
-//  LETTER BLOCKS  on the table
-// ═══════════════════════════════════════════════════════════
-const letter       = [];   // clickable block meshes
-const letterLabels = [];   // top-face label planes
-const letterColors = [0xff6699, 0xff99cc, 0xffccdd];
-const YES          = ['Y', 'E', 'S'];
-
-// Resting positions on the table (world space)
-const TABLE_Y  = 1.14 + 0.075; // tabletop top surface + half block height
-const TABLE_Z  = -5;
+const envMeshes   = [];   // clickable envelope bodies
+const noteMeshes  = [];   // letter-paper planes (hidden until inspect)
+const sealMeshes  = [];   // wax seal circles
 
 for (let i = 0; i < 3; i++) {
-    const blockX = (i - 1) * 2; // -2, 0, +2
-
-    const mesh = new THREE.Mesh(
-        new THREE.BoxGeometry(1, 0.15, 1),
-        new THREE.MeshPhongMaterial({ color: letterColors[i], emissive: 0x220011, shininess: 120 })
+    // ── Envelope body ─────────────────────────────────────
+    const env = new THREE.Mesh(
+        new THREE.BoxGeometry(1.1, 0.04, 0.8),
+        new THREE.MeshPhongMaterial({ color: ENV_COLORS[i], shininess: 40 })
     );
-    mesh.position.set(blockX, TABLE_Y, TABLE_Z);
-    mesh.castShadow = true;
-    scene.add(mesh);
-    letter.push(mesh);
+    env.position.copy(REST_POS[i]);
+    env.rotation.copy(REST_ROT[i]);
+    env.castShadow = true;
+    scene.add(env);
+    envMeshes.push(env);
 
-    // Letter label on top face
-    const label = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.85, 0.85),
+    // ── Wax seal (circle with letter) ─────────────────────
+    const seal = new THREE.Mesh(
+        new THREE.CircleGeometry(0.17, 16),
         new THREE.MeshBasicMaterial({
-            map: createTextTexture(YES[i], '#ffffff', 100, 256, 256),
+            map: makeTextTex(YES[i], SEAL_COLORS[i], 72, 128, 128),
             transparent: true,
+        })
+    );
+    seal.position.copy(REST_POS[i]);
+    seal.position.y += 0.026;
+    seal.rotation.copy(REST_ROT[i]);
+    scene.add(seal);
+    sealMeshes.push(seal);
+
+    // ── Note (letter paper) — hidden until inspect ─────────
+    // PlaneGeometry size = how big the note looks in front of the player
+    // Increase (2.6, 1.95) to make it larger
+    const note = new THREE.Mesh(
+        new THREE.PlaneGeometry(2.6, 1.95),
+        new THREE.MeshBasicMaterial({
+            map: makeLetterTex(CONTENTS[i]),
+            transparent: true,
+            opacity: 0,
             side: THREE.DoubleSide,
         })
     );
-    label.position.set(blockX, TABLE_Y + 0.08, TABLE_Z);
-    label.rotation.x = -Math.PI / 2;
-    scene.add(label);
-    letterLabels.push(label);
+    note.visible = false;
+    scene.add(note);
+    noteMeshes.push(note);
 }
 
 // ═══════════════════════════════════════════════════════════
-//  INSPECT MODE  —  click a letter → floats in front of camera
-//                   press ESC → returns to table
+//  INSPECT MODE
+//  Click envelope → note floats in front of player (top-down readable)
+//  ESC            → note hides, envelope snaps back to exact original state
 // ═══════════════════════════════════════════════════════════
-let inspectMode   = false;
-let inspectedIdx  = -1;       // which letter (0/1/2) is being inspected
-let inspectLerp   = 0;        // 0 = at table, 1 = in front of camera
+let inspectMode  = false;
+let inspectedIdx = -1;
 
-// Saved world-space rest transform per letter
-const restPositions = letter.map(l => l.position.clone());
+// Exact saved state — restored on ESC
+const savedEnvPos = new THREE.Vector3();
+const savedEnvRot = new THREE.Euler();
 
-// Where "in front of camera" is computed each frame dynamically
-function getInspectTarget() {
+// Target: note hovers ~1.4 m ahead, tilted so you read it like holding paper
+function getNoteTarget() {
     const dir = new THREE.Vector3();
     camera.getWorldDirection(dir);
-    return camera.position.clone().add(dir.multiplyScalar(1.5)).add(new THREE.Vector3(0, -0.1, 0));
+    return camera.position.clone()
+        .addScaledVector(dir, 1.4)
+        .add(new THREE.Vector3(0, -0.2, 0));
 }
 
 function enterInspect(idx) {
-    inspectMode   = true;
-    inspectedIdx  = idx;
-    inspectLerp   = 0;
-    // Release pointer lock so ESC works normally
+    if (inspectMode) return;
+    inspectMode  = true;
+    inspectedIdx = idx;
+
+    // Save envelope state
+    savedEnvPos.copy(envMeshes[idx].position);
+    savedEnvRot.copy(envMeshes[idx].rotation);
+
+    // Unlock pointer — browser needs this for ESC to work
     if (document.pointerLockElement) document.exitPointerLock();
-    // Show ESC hint
+
+    // Prepare note (starts transparent, fades in)
+    noteMeshes[idx].position.copy(getNoteTarget());
+    noteMeshes[idx].quaternion.copy(camera.quaternion);
+    noteMeshes[idx].visible = true;
+    noteMeshes[idx].material.opacity = 0;
+
     document.getElementById('esc-hint').style.opacity = '1';
 }
 
 function exitInspect() {
+    if (!inspectMode) return;
+    const idx = inspectedIdx;
+
+    // ── Hide note ──────────────────────────────────────────
+    noteMeshes[idx].visible = false;
+    noteMeshes[idx].material.opacity = 0;
+
+    // ── Restore envelope to EXACT original position & rotation ──
+    envMeshes[idx].position.copy(savedEnvPos);
+    envMeshes[idx].rotation.copy(savedEnvRot);
+    sealMeshes[idx].position.copy(savedEnvPos);
+    sealMeshes[idx].position.y += 0.026;
+    sealMeshes[idx].rotation.copy(savedEnvRot);
+
     inspectMode  = false;
     inspectedIdx = -1;
     document.getElementById('esc-hint').style.opacity = '0';
 }
 
-// ESC key
 document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && inspectMode) {
-        exitInspect();
-    }
+    if (e.key === 'Escape' && inspectMode) exitInspect();
 });
 
-// ─── Raycaster click ─────────────────────────────────────────
+// ─── Click to interact ───────────────────────────────────────
 const raycaster = new THREE.Raycaster();
-const mouse     = new THREE.Vector2();
-
-// We need to detect clicks differently:
-// - if pointer is locked, fire from screen centre
-// - if not locked (after inspect exit), fire from mouse pos
-let lastMousePos = { x: 0, y: 0 };
-document.addEventListener('mousemove', e => {
-    lastMousePos.x = e.clientX;
-    lastMousePos.y = e.clientY;
-});
+const mouse2d   = new THREE.Vector2();
 
 renderer.domElement.addEventListener('click', () => {
-    if (inspectMode) return; // don't re-click while inspecting
+    if (inspectMode) return;
+    if (!document.pointerLockElement) { renderer.domElement.requestPointerLock(); return; }
 
-    if (look.locked) {
-        // Pointer locked → ray from exact screen centre
-        mouse.set(0, 0);
-    } else {
-        mouse.x =  (lastMousePos.x / window.innerWidth)  * 2 - 1;
-        mouse.y = -(lastMousePos.y / window.innerHeight) * 2 + 1;
-    }
-
-    raycaster.setFromCamera(mouse, camera);
-    const hits = raycaster.intersectObjects(letter);
+    mouse2d.set(0, 0);   // crosshair = screen centre
+    raycaster.setFromCamera(mouse2d, camera);
+    const hits = raycaster.intersectObjects(envMeshes);
     if (hits.length > 0) {
-        const idx = letter.indexOf(hits[0].object);
+        const idx = envMeshes.indexOf(hits[0].object);
         enterInspect(idx);
-        // Fireworks burst from the letter
-        for (let b = 0; b < 4; b++) {
-            setTimeout(() => {
-                const p = restPositions[idx];
-                launchFirework(
-                    p.x + (Math.random() - 0.5) * 4,
-                    p.y + 2 + Math.random() * 3,
-                    p.z + (Math.random() - 0.5) * 4
-                );
-            }, b * 180);
-        }
+        // Burst fireworks on click
+        for (let b = 0; b < 4; b++) setTimeout(() => {
+            launchFirework(
+                REST_POS[idx].x + (Math.random() - 0.5) * 6,
+                REST_POS[idx].y + 4 + Math.random() * 4,
+                REST_POS[idx].z + (Math.random() - 0.5) * 6
+            );
+        }, b * 200);
     }
 });
 
 // ═══════════════════════════════════════════════════════════
-//  FIREWORKS  —  spawned far from player
+//  FIREWORKS
 // ═══════════════════════════════════════════════════════════
 const fireworks = [];
-
-const FIREWORK_COLORS = [
-    0xff3366, 0xff6699, 0xffcc00, 0xff9900,
-    0x66ffcc, 0x00ccff, 0xcc66ff, 0xff66ff,
-    0xffffff, 0xffaacc, 0xffff66,
-];
+const FW_COLS = [0xff3366,0xff6699,0xffcc00,0xff9900,0x66ffcc,0x00ccff,0xcc66ff,0xff66ff,0xffffff,0xffaacc,0xffff66];
 
 function launchFirework(x, y, z) {
-    const count = 160 + Math.floor(Math.random() * 80);
-    const color = FIREWORK_COLORS[Math.floor(Math.random() * FIREWORK_COLORS.length)];
-
-    const positions  = new Float32Array(count * 3);
-    const velocities = [];
-
-    for (let i = 0; i < count; i++) {
-        positions[i * 3]     = x;
-        positions[i * 3 + 1] = y;
-        positions[i * 3 + 2] = z;
-        const theta = Math.random() * Math.PI * 2;
-        const phi   = Math.acos(2 * Math.random() - 1);
-        const speed = 0.06 + Math.random() * 0.12;
-        velocities.push({
-            vx: speed * Math.sin(phi) * Math.cos(theta),
-            vy: speed * Math.sin(phi) * Math.sin(theta),
-            vz: speed * Math.cos(phi),
-        });
+    const n = 160 + Math.floor(Math.random() * 80);
+    const col = FW_COLS[Math.floor(Math.random() * FW_COLS.length)];
+    const pos = new Float32Array(n * 3);
+    const vel = [];
+    for (let i = 0; i < n; i++) {
+        pos[i*3]=x; pos[i*3+1]=y; pos[i*3+2]=z;
+        const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1), sp=0.06+Math.random()*0.13;
+        vel.push({ vx:sp*Math.sin(ph)*Math.cos(th), vy:sp*Math.sin(ph)*Math.sin(th), vz:sp*Math.cos(ph) });
     }
-
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const mat = new THREE.PointsMaterial({ color, size: 0.22, transparent: true, opacity: 1, sizeAttenuation: true });
-    const points = new THREE.Points(geo, mat);
-    scene.add(points);
-    fireworks.push({ points, geo, velocities, life: 0, maxLife: 90 + Math.floor(Math.random() * 50) });
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const pts = new THREE.Points(geo, new THREE.PointsMaterial({ color:col, size:0.22, transparent:true, opacity:1, sizeAttenuation:true }));
+    scene.add(pts);
+    fireworks.push({ pts, geo, vel, life:0, max:90+Math.floor(Math.random()*50) });
 }
 
 function updateFireworks() {
-    for (let f = fireworks.length - 1; f >= 0; f--) {
-        const fw = fireworks[f];
-        fw.life++;
-        const pos = fw.geo.attributes.position.array;
-        const t   = fw.life / fw.maxLife;
-        for (let i = 0; i < fw.velocities.length; i++) {
-            const v = fw.velocities[i];
-            v.vy -= 0.0022;
-            v.vx *= 0.970; v.vy *= 0.970; v.vz *= 0.970;
-            pos[i * 3]     += v.vx;
-            pos[i * 3 + 1] += v.vy;
-            pos[i * 3 + 2] += v.vz;
+    for (let f = fireworks.length-1; f >= 0; f--) {
+        const fw = fireworks[f]; fw.life++;
+        const p = fw.geo.attributes.position.array;
+        for (let i = 0; i < fw.vel.length; i++) {
+            const v = fw.vel[i];
+            v.vy -= 0.002; v.vx *= 0.972; v.vy *= 0.972; v.vz *= 0.972;
+            p[i*3]+=v.vx; p[i*3+1]+=v.vy; p[i*3+2]+=v.vz;
         }
-        fw.points.material.opacity = 1 - t;
+        fw.pts.material.opacity = 1 - fw.life/fw.max;
         fw.geo.attributes.position.needsUpdate = true;
-        if (fw.life >= fw.maxLife) {
-            scene.remove(fw.points);
-            fw.geo.dispose();
-            fw.points.material.dispose();
-            fireworks.splice(f, 1);
+        if (fw.life >= fw.max) {
+            scene.remove(fw.pts); fw.geo.dispose(); fw.pts.material.dispose(); fireworks.splice(f,1);
         }
     }
 }
 
-// Auto fireworks — spawned FAR from player (radius 18–28 units away)
-function scheduleRandomFirework() {
+// Auto fireworks — far from player
+function scheduleFirework() {
     setTimeout(() => {
-        // Pick a random angle around the player and push it far out
-        const angle  = Math.random() * Math.PI * 2;
-        const radius = 18 + Math.random() * 10;  // ← distance from player; increase to push further
-        launchFirework(
-            Math.sin(angle) * radius,
-            8 + Math.random() * 8,               // ← height range of auto fireworks
-            Math.cos(angle) * radius
-        );
-        scheduleRandomFirework();
-    }, 1800 + Math.random() * 1600);
+        const a=Math.random()*Math.PI*2, r=18+Math.random()*12;    // ← r = distance away
+        launchFirework(Math.sin(a)*r, 9+Math.random()*9, Math.cos(a)*r); // ← height range
+        scheduleFirework();
+    }, 1800 + Math.random()*1600);
 }
-scheduleRandomFirework();
+scheduleFirework();
 
 // ═══════════════════════════════════════════════════════════
-//  RISING PARTICLES  (ambient floaty sparkles)
+//  AMBIENT SPARKLES
 // ═══════════════════════════════════════════════════════════
 const particles = [];
-
-function createParticle() {
+function spawnParticle() {
     const p = new THREE.Mesh(
-        new THREE.SphereGeometry(0.06, 5, 5),
-        new THREE.MeshBasicMaterial({
-            color: new THREE.Color().setHSL(Math.random(), 1, 0.65),
-            transparent: true, opacity: 0.9,
-        })
+        new THREE.SphereGeometry(0.05, 5, 5),
+        new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(Math.random(),1,0.65), transparent:true, opacity:0.9 })
     );
-    p.position.set((Math.random() - 0.5) * 14, -0.5, (Math.random() - 0.5) * 14);
-    p.userData.vy   = 0.018 + Math.random() * 0.035;
-    p.userData.life = 0;
-    scene.add(p);
-    particles.push(p);
+    p.position.set((Math.random()-0.5)*16, -0.3, (Math.random()-0.5)*16);
+    p.userData.vy = 0.015+Math.random()*0.03; p.userData.life=0;
+    scene.add(p); particles.push(p);
 }
-setInterval(createParticle, 110);
+setInterval(spawnParticle, 120);
 
 function updateParticles() {
-    for (let i = particles.length - 1; i >= 0; i--) {
-        const p = particles[i];
-        p.userData.life++;
-        p.position.y += p.userData.vy;
-        p.position.x += Math.sin(p.userData.life * 0.07) * 0.012;
-        p.material.opacity = Math.max(0, 1 - p.userData.life / 140);
-        if (p.userData.life > 140) {
-            scene.remove(p);
-            p.geometry.dispose();
-            p.material.dispose();
-            particles.splice(i, 1);
-        }
+    for (let i=particles.length-1; i>=0; i--) {
+        const p=particles[i]; p.userData.life++;
+        p.position.y+=p.userData.vy;
+        p.position.x+=Math.sin(p.userData.life*0.07)*0.01;
+        p.material.opacity=Math.max(0,1-p.userData.life/140);
+        if (p.userData.life>140) { scene.remove(p); p.geometry.dispose(); p.material.dispose(); particles.splice(i,1); }
     }
 }
 
@@ -460,48 +531,40 @@ function animate() {
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
 
-    // Spin decorative cube
-    cube.rotation.x += 0.008;
-    cube.rotation.y += 0.012;
+    // Camera applied once per frame — stable, no flicker
+    applyLook();
 
-    // Float signs
-    sign.position.y     = 3.2 + Math.sin(t * 0.7) * 0.12;
-    signBack.position.y = 3.2 + Math.sin(t * 0.7) * 0.12;
+    movePlayer();
 
-    // Orbit lights
-    pinkLight.position.x   = Math.sin(t * 0.45) * 10;
-    pinkLight.position.z   = Math.cos(t * 0.45) * 10;
-    purpleLight.position.x = Math.cos(t * 0.35) * 10;
-    purpleLight.position.z = Math.sin(t * 0.35) * 10;
+    // Floating signs
+    sign.position.y     = 3.5 + Math.sin(t * 0.7) * 0.1;
+    signBack.position.y = 3.5 + Math.sin(t * 0.7) * 0.1;
 
-    // ── Letter blocks ──────────────────────────────────────
-    for (let i = 0; i < letter.length; i++) {
-        const mesh  = letter[i];
-        const label = letterLabels[i];
+    // Orbiting lights
+    pinkLight.position.x   = Math.sin(t*0.45)*12; pinkLight.position.z   = Math.cos(t*0.45)*12;
+    purpleLight.position.x = Math.cos(t*0.35)*12; purpleLight.position.z = Math.sin(t*0.35)*12;
 
+    // ── Letter / note updates ───────────────────────────────
+    for (let i = 0; i < 3; i++) {
         if (inspectMode && i === inspectedIdx) {
-            // ── INSPECT: smoothly float letter in front of camera ──
-            inspectLerp = Math.min(1, inspectLerp + 0.04); // ← speed of float-in animation
-            const target = getInspectTarget();
-            mesh.position.lerp(target, 0.12);
-            // Spin slowly while inspected
-            mesh.rotation.y += 0.02;
-            // Label follows
-            label.position.copy(mesh.position).y += 0.09;
-            label.rotation.set(0, mesh.rotation.y, 0); // face camera-ish
-        } else if (!inspectMode && i === inspectedIdx && inspectedIdx !== -1) {
-            // Just exited — snap back
-            mesh.position.lerp(restPositions[i], 0.1);
-            mesh.rotation.y += 0.005;
-            label.position.set(restPositions[i].x, TABLE_Y + 0.08, TABLE_Z);
-            label.rotation.set(-Math.PI / 2, 0, 0);
-            if (mesh.position.distanceTo(restPositions[i]) < 0.01) inspectedIdx = -1;
-        } else {
-            // Normal idle bob on table
-            mesh.position.y = TABLE_Y + Math.sin(t * 1.1 + i * 1.2) * 0.05;
-            mesh.rotation.y += 0.005;
-            label.position.set(restPositions[i].x, mesh.position.y + 0.09, TABLE_Z);
-            label.rotation.set(-Math.PI / 2, 0, 0);
+            // Smooth float note to in-front-of-player position
+            const target = getNoteTarget();
+            noteMeshes[i].position.lerp(target, 0.12);
+            // Note always faces the camera (held horizontally to read)
+            // Tilt slightly toward player like holding paper
+            const q = camera.quaternion.clone();
+            noteMeshes[i].quaternion.slerp(q, 0.1);
+
+            // Fade note in
+            noteMeshes[i].material.opacity = Math.min(1, noteMeshes[i].material.opacity + 0.04);
+
+            // Envelope lifts slightly while open
+            envMeshes[i].position.y = savedEnvPos.y + 0.25 + Math.sin(t*2)*0.03;
+
+        } else if (!inspectMode) {
+            // Gentle idle bob — envelopes rest flat on blanket
+            envMeshes[i].position.y  = REST_POS[i].y + Math.sin(t*0.8 + i*1.2)*0.015;
+            sealMeshes[i].position.y = envMeshes[i].position.y + 0.026;
         }
     }
 
