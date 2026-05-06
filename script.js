@@ -36,21 +36,17 @@ const BOUNDARY = {                  // player cannot walk outside these limits
 const PLAYER_HEIGHT = 1.6;
 camera.position.set(0, PLAYER_HEIGHT, 6);
 
+// ── Starting look direction ─────────────────────────────────
+// yaw = horizontal angle. Math.PI = face toward -Z (toward picnic)
+//                          0      = face toward +Z (away from picnic)
 const look = { yaw: Math.PI, pitch: 0, locked: false };
 
-// Reusable quaternions — allocated once, never inside the render loop
-const _yawQ   = new THREE.Quaternion();
-const _pitchQ = new THREE.Quaternion();
-const _Y_AXIS = new THREE.Vector3(0, 1, 0);
-const _X_AXIS = new THREE.Vector3(1, 0, 0);
-
-function applyLook() {
-    look.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, look.pitch));
-    _yawQ.setFromAxisAngle(_Y_AXIS, look.yaw);
-    _pitchQ.setFromAxisAngle(_X_AXIS, look.pitch);
-    camera.quaternion.copy(_yawQ).multiply(_pitchQ);
-}
-applyLook();
+// Use camera.rotation with 'YXZ' order — the correct FPS order.
+// Three.js reads camera.rotation directly each frame; setting it
+// here means NO quaternion conflicts and NO snapping ever.
+camera.rotation.order = 'YXZ';
+camera.rotation.y = look.yaw;
+camera.rotation.x = look.pitch;
 
 // Pointer lock
 renderer.domElement.addEventListener('click', () => {
@@ -61,12 +57,16 @@ document.addEventListener('pointerlockchange', () => {
     look.locked = document.pointerLockElement === renderer.domElement;
 });
 
-// Update yaw/pitch directly in mousemove — no accumulation, no large delta buildup
-// applyLook() is called once per frame in animate(), not here
+// mousemove: just add delta straight to camera.rotation — no intermediate step
 document.addEventListener('mousemove', e => {
     if (!look.locked || inspectMode) return;
-    look.yaw   -= e.movementX * MOUSE_SENSITIVITY;
-    look.pitch -= e.movementY * MOUSE_SENSITIVITY;
+    camera.rotation.y -= e.movementX * MOUSE_SENSITIVITY;  // ← horizontal
+    camera.rotation.x -= e.movementY * MOUSE_SENSITIVITY;  // ← vertical
+    // Clamp pitch so player can't flip upside down
+    camera.rotation.x = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, camera.rotation.x));
+    // Keep look in sync for movePlayer()
+    look.yaw   = camera.rotation.y;
+    look.pitch = camera.rotation.x;
 });
 
 // Touch look (mobile fallback)
@@ -76,8 +76,11 @@ renderer.domElement.addEventListener('touchstart', e => {
 }, { passive: true });
 window.addEventListener('touchmove', e => {
     if (!touch.on || inspectMode) return;
-    look.yaw   -= (e.touches[0].clientX - touch.lx) * MOUSE_SENSITIVITY * 2;
-    look.pitch -= (e.touches[0].clientY - touch.ly) * MOUSE_SENSITIVITY * 2;
+    camera.rotation.y -= (e.touches[0].clientX - touch.lx) * MOUSE_SENSITIVITY * 2;
+    camera.rotation.x -= (e.touches[0].clientY - touch.ly) * MOUSE_SENSITIVITY * 2;
+    camera.rotation.x = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, camera.rotation.x));
+    look.yaw   = camera.rotation.y;
+    look.pitch = camera.rotation.x;
     touch.lx = e.touches[0].clientX; touch.ly = e.touches[0].clientY;
 }, { passive: true });
 window.addEventListener('touchend', () => { touch.on = false; });
@@ -530,9 +533,6 @@ const clock = new THREE.Clock();
 function animate() {
     requestAnimationFrame(animate);
     const t = clock.getElapsedTime();
-
-    // Camera applied once per frame — stable, no flicker
-    applyLook();
 
     movePlayer();
 
