@@ -241,7 +241,7 @@ function makeTextTex(text, color = '#ffffff', size = 52, w = 1024, h = 256) {
 }
 
 const sign = new THREE.Mesh(new THREE.PlaneGeometry(9, 1.8),
-    new THREE.MeshBasicMaterial({ map: makeTextTex('Will you go out with me? 💕','#ff9ec4'), transparent:true, side:THREE.DoubleSide }));
+    new THREE.MeshBasicMaterial({ map: makeTextTex('May I be your Boyfriend? 💕','#ff9ec4'), transparent:true, side:THREE.DoubleSide }));
 sign.position.set(0, 3.5, -11); scene.add(sign);
 
 const signBack = new THREE.Mesh(new THREE.PlaneGeometry(9, 1.8),
@@ -253,7 +253,7 @@ signBack.position.set(0, 3.5, 9.5); signBack.rotation.y = Math.PI; scene.add(sig
 // ═══════════════════════════════════════════════════════════
 const CONTENTS = [
     ['To my favorite person,', '', 'Every moment with you feels', 'like sunshine. ☀️', '', 'You make everything brighter.', 'Always. 💛'],
-    ['Hey you,', '', 'I\'ve been meaning to ask...', 'Will you go out with me? 🌸', '', 'Pretty please?', '  — Your secret admirer'],
+    ['Hey you,', '', 'I\'ve been meaning to ask...', 'May I be your Boyfriend? 🌸', '', 'Pretty please?', '  — Your secret admirer'],
     ['P.S.  Just say yes. 😊', '', 'I promise picnics,', 'sunsets, and fireworks 🎆', '', '...and lots of letters', 'just like this one. 💌'],
 ];
 
